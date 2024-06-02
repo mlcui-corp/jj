@@ -26,6 +26,7 @@ use std::fs::Metadata;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Read as _;
+use std::io::Seek;
 use std::io::Write as _;
 use std::iter;
 use std::mem;
@@ -999,10 +1000,23 @@ pub enum TreeStateError {
     },
     #[error("Writing tree state to temporary file {path}")]
     WriteTreeState { path: PathBuf, source: io::Error },
+    #[error("Copying tree state from {read_path} to temporary file {write_path}")]
+    CopyTreeState {
+        read_path: PathBuf,
+        write_path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("Persisting tree state to file {path}")]
     PersistTreeState { path: PathBuf, source: io::Error },
     #[error("Filesystem monitor error")]
     Fsmonitor(#[source] Box<dyn Error + Send + Sync>),
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub enum TreeStateChanged {
+    Clean,
+    DirtyOnlyClock,
+    Dirty,
 }
 
 impl TreeState {
@@ -1186,6 +1200,52 @@ impl TreeState {
         Ok(())
     }
 
+    fn save_only_clock(&mut self) -> Result<(), TreeStateError> {
+        let proto = crate::protos::local_working_copy::TreeState {
+            watchman_clock: self.watchman_clock.clone(),
+            ..Default::default()
+        };
+
+        let wrap_write_err = |source| TreeStateError::WriteTreeState {
+            path: self.state_path.clone(),
+            source,
+        };
+        let mut temp_file = NamedTempFile::new_in(&self.state_path).map_err(wrap_write_err)?;
+        let target_path = self.state_path.join("tree_state");
+
+        // If the same non-repeated field appears multiple times, only the last will be
+        // used: https://protobuf.dev/programming-guides/encoding/#last-one-wins
+        // Reuse the existing serialisation of the proto in the current state to avoid
+        // serialising non-changed fields.
+        let bytes_written = std::fs::copy(&target_path, temp_file.path()).map_err(|err| {
+            TreeStateError::CopyTreeState {
+                read_path: target_path.clone(),
+                write_path: temp_file.path().to_owned(),
+                source: err,
+            }
+        })?;
+
+        let file = temp_file.as_file_mut();
+        file.seek(std::io::SeekFrom::Start(bytes_written))
+            .map_err(wrap_write_err)?;
+
+        // TODO: Deduplicate this with `save()` above.
+        file.write_all(&proto.encode_to_vec())
+            .map_err(wrap_write_err)?;
+        // update own write time while we before we rename it, so we know
+        // there is no unknown data in it
+        self.update_own_mtime();
+        // TODO: Retry if persisting fails (it will on Windows if the file happened to
+        // be open for read).
+        persist_temp_file(temp_file, &target_path).map_err(|source| {
+            TreeStateError::PersistTreeState {
+                path: target_path.clone(),
+                source,
+            }
+        })?;
+        Ok(())
+    }
+
     fn reset_watchman(&mut self) {
         self.watchman_clock.take();
     }
@@ -1257,7 +1317,7 @@ impl TreeState {
     pub async fn snapshot(
         &mut self,
         options: &SnapshotOptions<'_>,
-    ) -> Result<(bool, SnapshotStats), SnapshotError> {
+    ) -> Result<(TreeStateChanged, SnapshotStats), SnapshotError> {
         let SnapshotOptions {
             base_ignores,
             progress,
@@ -1269,7 +1329,12 @@ impl TreeState {
         let sparse_matcher = self.sparse_matcher();
 
         let fsmonitor_clock_needs_save = self.fsmonitor_settings != FsmonitorSettings::None;
-        let mut is_dirty = fsmonitor_clock_needs_save;
+        let clean_tree_retval = if fsmonitor_clock_needs_save {
+            TreeStateChanged::DirtyOnlyClock
+        } else {
+            TreeStateChanged::Clean
+        };
+        let mut is_dirty = false;
         let FsmonitorMatcher {
             matcher: fsmonitor_matcher,
             watchman_clock,
@@ -1288,7 +1353,7 @@ impl TreeState {
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             self.watchman_clock = watchman_clock;
-            return Ok((is_dirty, SnapshotStats::default()));
+            return Ok((clean_tree_retval, SnapshotStats::default()));
         }
 
         let (tree_entries_tx, tree_entries_rx) = channel();
@@ -1379,7 +1444,14 @@ impl TreeState {
         } else {
             tracing::info!("not updating watchman clock because there are untracked files");
         }
-        Ok((is_dirty, stats))
+        Ok((
+            if is_dirty {
+                TreeStateChanged::Dirty
+            } else {
+                clean_tree_retval
+            },
+            stats,
+        ))
     }
 
     #[instrument(skip_all)]
@@ -2589,7 +2661,7 @@ impl WorkingCopy for LocalWorkingCopy {
             wc,
             old_operation_id,
             old_tree,
-            tree_state_dirty: false,
+            tree_state_dirty: TreeStateChanged::Clean,
             new_workspace_name: None,
             _lock: lock,
         }))
@@ -2766,7 +2838,7 @@ pub struct LockedLocalWorkingCopy {
     wc: LocalWorkingCopy,
     old_operation_id: OperationId,
     old_tree: MergedTree,
-    tree_state_dirty: bool,
+    tree_state_dirty: TreeStateChanged,
     new_workspace_name: Option<WorkspaceNameBuf>,
     _lock: FileLock,
 }
@@ -2787,7 +2859,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
         let tree_state = self.wc.tree_state_mut()?;
         let (is_dirty, stats) = tree_state.snapshot(options).await?;
-        self.tree_state_dirty |= is_dirty;
+        self.tree_state_dirty = self.tree_state_dirty.max(is_dirty);
         Ok((tree_state.current_tree().clone(), stats))
     }
 
@@ -2798,7 +2870,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         let tree_state = self.wc.tree_state_mut()?;
         if tree_state.tree.tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
             let stats = tree_state.check_out(&new_tree)?;
-            self.tree_state_dirty = true;
+            self.tree_state_dirty = TreeStateChanged::Dirty;
             Ok(stats)
         } else {
             Ok(CheckoutStats::default())
@@ -2812,14 +2884,14 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     async fn reset(&mut self, commit: &Commit) -> Result<(), ResetError> {
         let new_tree = commit.tree();
         self.wc.tree_state_mut()?.reset(&new_tree).await?;
-        self.tree_state_dirty = true;
+        self.tree_state_dirty = TreeStateChanged::Dirty;
         Ok(())
     }
 
     async fn recover(&mut self, commit: &Commit) -> Result<(), ResetError> {
         let new_tree = commit.tree();
         self.wc.tree_state_mut()?.recover(&new_tree).await?;
-        self.tree_state_dirty = true;
+        self.tree_state_dirty = TreeStateChanged::Dirty;
         Ok(())
     }
 
@@ -2837,7 +2909,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             .wc
             .tree_state_mut()?
             .set_sparse_patterns(new_sparse_patterns)?;
-        self.tree_state_dirty = true;
+        self.tree_state_dirty = TreeStateChanged::Dirty;
         Ok(stats)
     }
 
@@ -2848,16 +2920,28 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         assert!(
             self.tree_state_dirty
+                == TreeStateChanged::Dirty
                 || self.old_tree.tree_ids_and_labels() == self.wc.tree()?.tree_ids_and_labels()
         );
-        if self.tree_state_dirty {
-            self.wc
-                .tree_state_mut()?
-                .save()
-                .map_err(|err| WorkingCopyStateError {
-                    message: "Failed to write working copy state".to_string(),
-                    err: Box::new(err),
+        match self.tree_state_dirty {
+            TreeStateChanged::Clean => (),
+            TreeStateChanged::DirtyOnlyClock => {
+                self.wc.tree_state_mut()?.save_only_clock().map_err(|err| {
+                    WorkingCopyStateError {
+                        message: "Failed to write working copy clock".to_string(),
+                        err: Box::new(err),
+                    }
                 })?;
+            }
+            TreeStateChanged::Dirty => {
+                self.wc
+                    .tree_state_mut()?
+                    .save()
+                    .map_err(|err| WorkingCopyStateError {
+                        message: "Failed to write working copy state".to_string(),
+                        err: Box::new(err),
+                    })?;
+            }
         }
         if self.old_operation_id != operation_id || self.new_workspace_name.is_some() {
             self.wc.checkout_state.operation_id = operation_id;
@@ -2874,7 +2958,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
 impl LockedLocalWorkingCopy {
     pub fn reset_watchman(&mut self) -> Result<(), SnapshotError> {
         self.wc.tree_state_mut()?.reset_watchman();
-        self.tree_state_dirty = true;
+        self.tree_state_dirty = self.tree_state_dirty.max(TreeStateChanged::DirtyOnlyClock);
         Ok(())
     }
 }
