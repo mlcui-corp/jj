@@ -42,6 +42,7 @@ use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::local_working_copy::EolConversionMode;
 use jj_lib::local_working_copy::ExecChangeSetting;
 use jj_lib::local_working_copy::TreeState;
+use jj_lib::local_working_copy::TreeStateChanged;
 use jj_lib::local_working_copy::TreeStateError;
 use jj_lib::local_working_copy::TreeStateSettings;
 use jj_lib::lock::FileLock;
@@ -562,7 +563,7 @@ async fn rewrite_commit(
 
     let options = pool.snapshot_options(base_ignores);
     tracing::debug!("trying to snapshot the new tree");
-    let (dirty, stats) = workspace
+    let (tree_state_changed, stats) = workspace
         .tree_state
         .snapshot(&options)
         .await
@@ -570,6 +571,7 @@ async fn rewrite_commit(
             commit_id: commit.id().clone(),
             source,
         })?;
+    let dirty = tree_state_changed == TreeStateChanged::Dirty;
     if !dirty {
         tracing::debug!(
             "commit {} was not modified as the passed command did not modify any tracked files",
